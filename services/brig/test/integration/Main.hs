@@ -1,14 +1,19 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveGeneric #-}
 
 module Main (main) where
 
 import Bilge (newManager, host, port, Request)
 import Cassandra as Cql
 import Cassandra.Settings as Cql
+import Data.Aeson
+import Data.ByteString.Char8 (pack)
+import Data.Text (unpack)
 import Data.Word
+import Data.Yaml (decodeFileEither, ParseException)
+import GHC.Generics
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import OpenSSL (withOpenSSL)
-import System.Environment
 import System.Logger (Logger)
 import Test.Tasty
 
@@ -18,46 +23,73 @@ import qualified API.Search    as Search
 import qualified API.Team      as Team
 import qualified API.TURN      as TURN
 import qualified API.User.Auth as UserAuth
+import qualified Brig.Options  as Opts
 import qualified System.Logger as Logger
 
+-- TODO: move to common lib
+
+data Endpoint = Endpoint String Word16
+  deriving (Show, Generic)
+
+data Config = Config
+  -- internal endpoints
+  { confBrig      :: Endpoint
+  , confCannon    :: Endpoint
+  , confGalley    :: Endpoint
+
+  , cert          :: FilePath
+  } deriving (Show, Generic)
+
+instance FromJSON Endpoint
+instance FromJSON Config
+
+decodeConfigFile :: (FromJSON c) => FilePath -> IO (Either ParseException c)
+decodeConfigFile = decodeFileEither
+
+runTests :: (Config, Opts.Opts) -> IO ()
+runTests (iConf, bConf) = do
+    let brig      = mkRequest $ confBrig iConf
+        cannon    = mkRequest $ confCannon iConf
+        galley    = mkRequest $ confGalley iConf
+        turnFile  = Opts.servers . Opts.turn $ bConf
+        cassandra = Opts.endpoint . Opts.cassandra $ bConf
+
+    lg <- Logger.new Logger.defSettings
+    db <- initCassandra cassandra lg
+    mg <- newManager tlsManagerSettings
+
+    userApi     <- User.tests bConf mg brig cannon galley
+    userAuthApi <- UserAuth.tests bConf mg lg brig
+    providerApi <- Provider.tests bConf (cert iConf) mg db brig cannon galley
+    searchApis  <- Search.tests mg brig
+    teamApis    <- Team.tests mg brig cannon galley
+    turnApi     <- TURN.tests mg brig turnFile
+
+    defaultMain $ testGroup "Brig API Integration"
+        [ userApi
+        , userAuthApi
+        , providerApi
+        , searchApis
+        , teamApis
+        , turnApi
+        ]
+
 main :: IO ()
-main = lookupEnv "INTEGRATION_TEST" >>= maybe (return ()) (const run)
-  where
-    run = withOpenSSL $ do
-        brig     <- mkEndpoint . read <$> getEnv "BRIG_WEB_PORT"
-        cannon   <- mkEndpoint . read <$> getEnv "CANNON_WEB_PORT"
-        galley   <- mkEndpoint . read <$> getEnv "GALLEY_WEB_PORT"
-        turnFile <- getEnv "TURN_SERVERS"
+main = withOpenSSL $ do
+  iConf <- decodeConfigFile "/etc/wire/integration.yaml"
+  bConf <- decodeConfigFile "/etc/wire/brig.yaml"
 
-        lg <- Logger.new Logger.defSettings
-        db <- initCassandra lg
-        mg <- newManager tlsManagerSettings
+  let errorOrConfs = (,) <$> iConf <*> bConf
+  case errorOrConfs of
+    Left errs -> print errs
+    Right confs -> runTests confs
 
-        userApi     <- User.tests mg brig cannon galley
-        userAuthApi <- UserAuth.tests mg lg brig
-        providerApi <- Provider.tests mg db brig cannon galley
-        searchApis  <- Search.tests mg brig
-        teamApis    <- Team.tests mg brig cannon galley
-        turnApi     <- TURN.tests mg brig turnFile
-
-        defaultMain $ testGroup "Brig API Integration"
-            [ userApi
-            , userAuthApi
-            , providerApi
-            , searchApis
-            , teamApis
-            , turnApi
-            ]
-
-initCassandra :: Logger -> IO Cql.ClientState
-initCassandra lg = do
-    h <- getEnv "BRIG_CASSANDRA_HOST"
-    p <- fromInteger . read <$> getEnv "BRIG_CASSANDRA_PORT"
-    Cql.init lg $ Cql.setPortNumber p
-                . Cql.addContact h
+initCassandra :: Opts.Endpoint -> Logger -> IO Cql.ClientState
+initCassandra ep lg =
+    Cql.init lg $ Cql.setPortNumber (fromIntegral $ Opts.port ep)
+                . Cql.setContacts (unpack (Opts.host ep)) []
                 . Cql.setKeyspace (Cql.Keyspace "brig_test")
                 $ Cql.defSettings
 
-mkEndpoint :: Word16 -> Request -> Request
-mkEndpoint p = host "127.0.0.1" . port p
-
+mkRequest :: Endpoint -> Request -> Request
+mkRequest (Endpoint h p) = host (pack h) . port p
